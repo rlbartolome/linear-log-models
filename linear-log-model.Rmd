@@ -1,0 +1,449 @@
+---
+title: "STAT 218 - Analytics Project I"
+author: "Inigo Benavides and Rommel Bartolome"
+date: "February 22, 2019"
+abstract: "We create two models: (1) a linear regression model to predict the water rate and (2) a logistic regression model to predict whether a given district has wastage rating of less than or equal to 25%. We engineered a `desirability score` to find the best model that balances the tradeoff between interpretability and predictive power. For both, we ensured first that all model assumptions are valid. We found that the simple linear model `wd_rate ~ nrwpcent + sprw` is the most desirable model with 0.2806605 test MSE. For the logistic regression model, `nrwpcent_class ~ REGION.III + cities + REGION.VII + sprw + REGION.XI + surw` has been found to be the most desirable model. However, it appears to only have 46% accuracy."
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Introduction
+
+Here in this project, we build two models:
+
+- A linear regression model to predict the `wd_rate` (water rate in Pesos) for differt water districts in the Philippines given a number of features.
+- A logistic regression model to predict whether a given water district has `nrwpcent` less than or equal to 25% or greater.
+
+Below we employ various techniques to search for a good fitting model, subject to the following:
+
+- Regression assumptions should be validated with tests at 10% significance
+- VIF <= 10
+- Cannot remove more than 2% of sample size
+- Should have best performance on test set, using RMSE <= 15% and error rate less than 10% for categorical models.
+
+## Loading The Data
+
+First we load all necessary libraries for this project. We then load our sample data set and remove the indexed `X1` column, then split into `df_train` for the first 250 rows then `df_test` for the last 50.
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library("tidyverse")
+library("caret")
+library("GGally")
+library("car")
+library("pROC")
+
+setwd("~/Stat 218/Analytics Project 1")
+df <- read_csv("data_BaBe.csv") %>%
+  select(-c(X1)) %>%
+  mutate(REGION=as.factor(REGION),
+         WD.Area=as.factor(WD.Area),
+         Mun1=as.factor(case_when(Mun1 > 0 ~ 1, TRUE ~ 0)),
+         conn_log=log(conn),
+         vol_nrw_log=log(vol_nrw),
+         wd_rate_log=log(wd_rate),
+         conn_p_area_squared=conn_p_area^2,
+         nrwpcent_class=case_when(nrwpcent <= 25 ~ 1, TRUE ~ 0) # Engineer categorical variable
+         )
+# Engineer Mun1 as factor (1 ~ greater than 0, 0 ~ equal to 0)
+df_dummies <- dummyVars(~ ., data=df, fullRank=TRUE) %>% predict(df) %>% as.data.frame()
+df_dummies_train <- df_dummies[1:250,]
+df_dummies_test <- df_dummies[251:300,]
+# Train test split first 250 vs. last 50
+df_train <- df[1:250,]
+df_test <- df[251:300,]
+df %>% head
+```
+
+## Exploratory Data Analysis
+
+First, which features have the highest correlation with `wd_rate`?
+
+```{r}
+cor_matrix <- cor(df_dummies)['wd_rate',] %>% sort()
+cor_matrix
+```
+
+
+```{r}
+df %>%
+  select(c(wd_rate_log, conn_log, vol_nrw_log, nrwpcent, sprw)) %>% 
+  ggpairs(progress=FALSE)
+```
+
+Above, we inspect the correlation of `wd_rate` against `conn_log`, `vol_nrw_log`, `nrwpcent`, and `sprw`. We find a strong correlation between `conn_log` and `vol_new_log`.
+
+## Regression model
+
+We first fit on all the features:
+
+```{r}
+# df_train %>% select(-c(wd_rate_log)) %>% lm(wd_rate_log ~ ., data=.) %>% summary()
+df_train_regression <- df_train %>% select(-c(nrwpcent_class, wd_rate_log))
+df_test_regression <- df_test %>% select(-c(nrwpcent_class, wd_rate_log))
+full_model <- lm(wd_rate ~ ., data=df_train_regression)
+full_model %>% summary
+```
+
+```{r}
+model_coefs <- summary(full_model)$coeff[-1, 4]
+significant_predictors <- model_coefs[model_coefs < 0.10]
+
+significant_predictors
+```
+
+After fitting the full model, we find that only 9 features have significant betas to within 10%.
+
+```{r warning=FALSE}
+# Test set performance benchmark
+evaluateRMSE <- function(model, df_set) {
+  predictions <- model %>% predict(df_set) %>% as.vector()
+  obs <- df_set$wd_rate %>% as.vector()
+  rmse <- sqrt(mean((predictions - obs)^2)) / (mean(obs))
+  return(rmse)
+}
+
+evaluateRMSE(full_model, df_test_regression)
+```
+
+### Recursive Feature Selection
+After checking the full model, we employ forward, backward and stepwise feature selection:
+
+```{r}
+# Run backward elimination
+initial_model <- lm(wd_rate ~ 1, data = df_train_regression)
+
+back_elim <- step(object = full_model, scope = list(lower = initial_model), direction = "backward")
+```
+
+After running backward elimination, we find a model with AIC of 2139.43. We will now run the forward elimination and the stepwise elimination:
+
+```{r}
+# Run forward elimination
+forward_elim <- step(object = initial_model, scope = list(upper = full_model), direction = "forward")
+```
+
+```{r}
+# Run stepwise selection
+step_sel <- step(object = initial_model, scope = list(upper = full_model), direction = "both")
+```
+
+After using these techniques, we find the "best" one:
+
+```{r warning=FALSE}
+fitstat <- function(x) {
+  xsum <- summary(x)
+  resid <- x$residuals
+  fit <- x$fitted.values
+  test_rmse <- evaluateRMSE(x, df_test_regression)
+  return(c(R2 = xsum$r.squared,
+           R2Adj = xsum$adj.r.squared,
+           AIC = AIC(x),
+           BIC = BIC(x),
+           MSE = mean(resid^2),
+           MAPE = mean(abs(resid/fit)),
+           RMSE_test = test_rmse
+  ))}
+
+sapply(list('Full Model' = full_model,
+            'Forward Elimination' = forward_elim,
+            'Backward Elimination' = back_elim,
+            'Stepwise Selection' = step_sel), fitstat)
+
+```
+
+In summary, the backward elimination procedure found the model with the lowest test RMSE of 0.2496. However, if we inspect the significance of the best model, we find that only 8 of the 21 features are significant.
+
+```{r}
+back_elim %>% summary
+```
+
+```{r}
+back_elim %>% vif
+```
+
+In terms of enforcing the multicollinearity assumption, the model coefficients all have VIFs less than 10.
+
+```{r}
+par(mfrow=c(2,2))
+plot(back_elim)
+```
+
+To validate the regression model's assumptions, we plot the above charts, and we find that the model fits the linear regression model assumptions.
+
+### All Possible Model's approach
+
+In this secion, we search for a model by trying all possible combinations after filtering out insignificant features through univariate filtering. We first run a correlation plot against the predictor to prune out unrelated features, such that it is close to 0.
+
+```{r}
+cor_matrix <- cor(df_dummies_train)['wd_rate',] %>% abs %>% sort
+cor_matrix
+```
+
+Based on the above, we remove the features whose correlation is less than 0.05: `Mun4`, `surw`, `Mun2`, `Mun5`, `cities`, `Mun3`, `conn_p_area`, `vol_nrw_log`, `conn_p_area_squared`. We also decided to remove `WD.Area` because it produces null betas.
+```{r}
+cor_matrix[cor_matrix < 0.05]
+```
+We retain `REGION` because we find that other categoricals have correlation >= 0.05.
+
+```{r}
+
+# Subset constructor
+formulaConstructor <- function(predictors) {
+  predictors %>% paste(collapse=" + ") %>% paste("wd_rate ~", .) %>% as.formula()
+}
+
+# Define regression evaluation function
+evaluateRegression <- function(model, data, model_name) {
+  model_summary <- model %>% summary
+  r_squared <- model_summary$r.squared
+  adj_r_squared <- model_summary$adj.r.squared
+  aic <- model %>% AIC 
+  bic <- model %>% BIC
+  train_mse <- evaluateRMSE(model, df_train_regression)
+  test_mse <- evaluateRMSE(model, df_test_regression)
+  ps <- model_summary$coeff[,4]
+  num_significant <- length(ps[ps < 0.1]) - 1
+  
+  if (length(ps) >= 2) {
+    vifs <- model %>% vif()
+    vifs <- vifs[vifs > 10] %>% length
+  } else {
+      vifs <- 0
+    }
+  eval <- 
+    list(r_squared, adj_r_squared, aic, bic, train_mse, test_mse, num_significant, vifs) %>% 
+    as.data.frame()
+  
+  names(eval) <- c('r_squared', 'adj_r_squared', 'aic', 'bic', 
+                   'train_mse', 'test_mse', 'num_significant', 'vifs')
+  eval <- eval %>% mutate(model_name=model_name,
+                          num_predictors=model$rank - 1)
+  return(eval)
+}
+
+# We remove WD.Area
+sub_df <- df_train_regression %>% 
+  select(-c(Mun2, Mun3, Mun4, Mun5, cities, surw, conn_p_area, 
+            vol_nrw_log, conn_p_area_squared, WD.Area))
+predictors <- sub_df %>% colnames
+predictors <- predictors[predictors != 'wd_rate']
+
+# Subset constructor
+formulaConstructor <- function(predictors) {
+  predictors %>% paste(collapse=" + ") %>% paste("wd_rate ~", .)
+}
+
+# Define powerset function to generate all possible models
+powerset = function(set){
+	ps = list()
+	ps[[1]] = numeric()
+	for(element in set){
+		temp = vector(mode="list",length=length(ps))
+		for(subset in 1:length(ps)){
+			temp[[subset]] = c(ps[[subset]],element)
+		}
+		ps=c(ps,temp)
+	}
+	return(ps)
+}
+
+```
+
+```{r warning=FALSE}
+powerset_results <- powerset(predictors) %>%
+  Filter(function(x) length(x) >= 2, .) %>% 
+  Map(function(x) {
+    model_spec <- formulaConstructor(x)
+    restricted_model <- lm(model_spec[1], data=sub_df)
+    restricted_model_results <- evaluateRegression(restricted_model, metrics, model_spec)
+    return(restricted_model_results)
+    }, .) %>%  
+  Reduce(function(x, y) {
+    return(x %>% rbind(y))
+  }, .)
+```
+
+```{r}
+powerset_results %>% head
+```
+
+```{r}
+powerset_results %>% filter(num_significant == num_predictors)
+```
+
+
+We desire a model that is both predictive in the test set and has high proportion of significant predictors. We engineer a desirability score to capture this sentiment to balance the tradeoff between interpretability and predictive power.
+
+```{r}
+powerset_results %>%
+  mutate(prop_sig=num_significant / num_predictors) %>% 
+  mutate(desirabiity_score = prop_sig / test_mse) %>% 
+  arrange(desc(desirabiity_score)) %>% head
+```
+
+By inspection, we select the most desirable since it has just 2 predictors that are all significant and a test mse of 0.2806605 and no coefficients with high VIFs.
+
+```{r}
+desirable_model <- lm(wd_rate ~ nrwpcent + sprw, data=df_train_regression)
+desirable_model %>% summary
+```
+```{r}
+desirable_model %>% vif
+```
+```{r}
+par(mfrow=c(2,2))
+plot(desirable_model)
+```
+
+This desirable model seems to meet all the regression assumptions. We therefore make this our final model, with the following interpretation:
+
+1. For every increase in `nrwpcent` (percent of non-revenue water from total displaced water), we can expect a 0.73 increase in the water rate price.
+
+2. For every increase in `sprw` (number of spring water sources), we can expect a 5.22 decrease in the water rate price.
+
+```{r}
+df_train %>% ggplot(aes(x=nrwpcent, y=sprw, color=wd_rate)) + geom_point()
+```
+
+```{r}
+df_train %>% ggplot(aes(x=nrwpcent, y=wd_rate)) + geom_point() + geom_smooth(method="lm")
+```
+```{r}
+df_train %>% ggplot(aes(x=sprw, y=wd_rate)) + geom_point() + geom_smooth(method="lm")
+```
+
+We inspect the scatterplot of these significant variables to the `wd_rate` and indeed see the trend that corresponds to the betas.
+
+# Classification
+
+In this section, we build a classification model to predict whether a given water district has `nrwpcent_class` less than or equal to 25% or greater.
+
+We first inspect the class balance:
+
+```{r}
+# Inspect class balance
+df_train %>% group_by(nrwpcent_class) %>% summarise(freq=n())
+```
+```{r}
+df_train_classification <- df_dummies_train %>% 
+  select(-c(wd_rate_log, wd_rate, vol_nrw, vol_nrw_log, nrwpcent))
+df_test_classification <- df_dummies_test %>% 
+  select(-c(wd_rate_log, wd_rate, vol_nrw, vol_nrw_log, nrwpcent))
+```
+
+```{r}
+# We remove some features in this section
+sub_df <- df_train_classification %>% 
+  select(-c(Mun2, Mun3, Mun4, Mun5, conn_p_area, conn_p_area_squared, 
+            `WD.Area.Area 2`, `WD.Area.Area 3`, `WD.Area.Area 4`, `WD.Area.Area 5`, 
+            `WD.Area.Area 6`, `WD.Area.Area 7`, `WD.Area.Area 8`, `WD.Area.Area 9`))
+predictors <- sub_df %>% colnames
+predictors <- predictors[predictors != 'nrwpcent_class']
+
+# Subset constructor for classification
+formulaConstructor <- function(predictors) {
+  predictors %>% paste(collapse=" + ") %>% paste("nrwpcent_class ~", .)
+}
+
+```
+
+Again, similar to the "all models approach" in the linear regression we made, we also create a function for the classification model: 
+
+```{r}
+# Define function to evaluate classification model
+evaluateClassification <- function(model, model_name) {
+  model_summary <- model %>% summary
+  ps <- model_summary$coeff[,4]
+  num_significant <- length(ps[ps < 0.1])
+  predict_probabilities <- predict(model, df_dummies_test)
+  auc <- roc(df_dummies_test$nrwpcent_class, predict_probabilities)$auc[1]
+  
+  if (length(ps) >= 2) {
+    vifs <- model %>% vif()
+    vifs <- vifs[vifs > 10] %>% length
+  } else {
+      vifs <- 0
+  }
+  
+  eval <- list(auc, num_significant, vifs) %>% 
+    as.data.frame()
+  
+  names(eval) <- c('auc', 'num_significant', 'vifs')
+  eval <- eval %>% mutate(model_name=model_name,
+                          num_predictors=model$rank - 1)
+  return(eval)
+}
+
+```
+
+
+```{r warning=FALSE}
+full_model_classification <- predictors %>% 
+  formulaConstructor%>% lm(data=sub_df, family="binomial")
+full_model_classification %>% summary
+```
+
+
+```{r}
+# Evaluate logistic regression model AUC
+predict_probabilities <- predict(full_model_classification, df_dummies_test)
+
+predict_probabilities
+roc(df_dummies_test$nrwpcent_class, predict_probabilities)$auc[1]
+```
+The full model has an AUC of 0.5378422.
+
+We employ recursive feature selection:
+```{r warning=FALSE}
+initial_model_classification <- glm(nrwpcent_class ~ 1, data = df_dummies_train, family = "binomial")
+
+back_elim_classification <- step(object = full_model_classification, 
+                                 scope = list(lower = initial_model), direction = "backward")
+
+forward_elim_classfication <- step(object = initial_model_classification, 
+                                   scope = list(upper = full_model_classification), direction = "forward")
+
+stepwise_classification <- step(object = initial_model_classification, 
+                                scope = list(upper = initial_model), direction = "both")
+
+fitstat_classification <- function(x) {
+  predict_probabilities <- predict(x, df_dummies_test)
+  return(c(AUC = roc(df_dummies_test$nrwpcent_class, predict_probabilities)$auc[1]
+  ))}
+
+sapply(list('Full Model' = full_model_classification,
+            'Forward Elimination' = forward_elim_classfication,
+            'Backward Elimination' = back_elim_classification,
+            'Stepwise Selection' = stepwise_classification), fitstat_classification)
+
+```
+```{r}
+summary(forward_elim_classfication)
+```
+```{r}
+forward_elim_classfication %>% vif
+```
+
+
+```{r}
+par(mfrow=c(2,2))
+plot(forward_elim_classfication)
+```
+
+```{r}
+predicted_probabilities <- forward_elim_classfication %>% predict(df_dummies_test)
+
+predicted_probabilities
+
+predicted_probabilities[predicted_probabilities > 0.5] <- 1
+predicted_probabilities[predicted_probabilities <= 0.5] <- 0
+predicted_probabilities <- predicted_probabilities %>% as.vector() %>% as.factor
+observed <- (df_dummies_test %>% mutate(nrwpcent_class=as.factor(nrwpcent_class)))$nrwpcent_class
+confusionMatrix(data=predicted_probabilities, reference = observed)
+```
+
+Based on the above procedures, we select the model determined by our forward selection procedure since it has the highest test AUC of 0.54; however, it appears to only have 46% accuracy.
+
+
